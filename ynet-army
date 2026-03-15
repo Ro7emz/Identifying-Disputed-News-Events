@@ -1,0 +1,421 @@
+import json
+import re
+import sqlite3
+from datetime import datetime, timezone
+
+import feedparser
+import requests
+from bs4 import BeautifulSoup
+
+DB_PATH = "news.db"
+YNET_OUTLET_ID = 3
+
+# פידים רשמיים של ynet
+FEEDS = {
+    "חדשות": "https://www.ynet.co.il/Integration/StoryRss2.xml",
+    "מבזקים": "https://www.ynet.co.il/Integration/StoryRss1854.xml",
+    # אפשר להוסיף עוד בהמשך לפי ה-RSS index של ynet
+}
+
+HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+    ),
+    "Accept-Language": "he-IL,he;q=0.9,en;q=0.8",
+}
+
+session = requests.Session()
+session.headers.update(HEADERS)
+
+
+def utc_now_iso() -> str:
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+
+
+def clean_text(text: str | None) -> str | None:
+    if not text:
+        return None
+    text = re.sub(r"\s+", " ", text).strip()
+    return text or None
+
+
+def create_connection(db_path: str) -> sqlite3.Connection:
+    conn = sqlite3.connect(db_path)
+    conn.execute("PRAGMA foreign_keys = ON;")
+    return conn
+
+
+def get_or_create_category(conn: sqlite3.Connection, category_name: str) -> int:
+    conn.execute(
+        "INSERT OR IGNORE INTO categories (category_name) VALUES (?);",
+        (category_name,)
+    )
+    row = conn.execute(
+        "SELECT category_id FROM categories WHERE category_name = ?;",
+        (category_name,)
+    ).fetchone()
+    return row[0]
+
+
+def article_exists(conn: sqlite3.Connection, link: str) -> bool:
+    row = conn.execute(
+        "SELECT 1 FROM News_articles WHERE link = ? LIMIT 1;",
+        (link,)
+    ).fetchone()
+    return row is not None
+
+
+def link_article_to_category(conn: sqlite3.Connection, article_id: int, category_id: int) -> None:
+    conn.execute(
+        """
+        INSERT OR IGNORE INTO Article_Categories (news_article_id, category_id)
+        VALUES (?, ?);
+        """,
+        (article_id, category_id)
+    )
+
+
+def insert_article(conn: sqlite3.Connection, article: dict) -> int | None:
+    # בגלל שיש unique index על link
+    if article.get("link") and article_exists(conn, article["link"]):
+        return None
+
+    cur = conn.execute(
+        """
+        INSERT INTO News_articles (
+            news_outlet_id,
+            date,
+            title,
+            description,
+            type,
+            link,
+            text,
+            author_name,
+            scraped_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?);
+        """,
+        (
+            article["news_outlet_id"],
+            article.get("date"),
+            article["title"],
+            article.get("description"),
+            article.get("type"),
+            article.get("link"),
+            article.get("text"),
+            article.get("author_name"),
+            article.get("scraped_at"),
+        )
+    )
+    return cur.lastrowid
+
+
+def parse_feed_date(entry) -> str | None:
+    # feedparser מחזיר published / updated
+    for attr in ("published_parsed", "updated_parsed"):
+        parsed_value = getattr(entry, attr, None)
+        if parsed_value:
+            try:
+                dt = datetime(*parsed_value[:6], tzinfo=timezone.utc)
+                return dt.isoformat()
+            except Exception:
+                pass
+
+    for attr in ("published", "updated"):
+        raw_value = getattr(entry, attr, None)
+        if raw_value:
+            return clean_text(raw_value)
+
+    return None
+
+
+def safe_json_loads(value: str):
+    try:
+        return json.loads(value)
+    except Exception:
+        return None
+
+
+def extract_jsonld(soup: BeautifulSoup) -> list[dict]:
+    data_blocks = []
+    for script in soup.find_all("script", attrs={"type": "application/ld+json"}):
+        raw = script.string or script.get_text(" ", strip=True)
+        if not raw:
+            continue
+
+        loaded = safe_json_loads(raw)
+        if loaded is None:
+            continue
+
+        if isinstance(loaded, list):
+            data_blocks.extend([x for x in loaded if isinstance(x, dict)])
+        elif isinstance(loaded, dict):
+            if "@graph" in loaded and isinstance(loaded["@graph"], list):
+                data_blocks.extend([x for x in loaded["@graph"] if isinstance(x, dict)])
+            else:
+                data_blocks.append(loaded)
+
+    return data_blocks
+
+
+def first_nonempty(*values):
+    for value in values:
+        if isinstance(value, str):
+            cleaned = clean_text(value)
+            if cleaned:
+                return cleaned
+    return None
+
+
+def extract_author_from_jsonld(item: dict) -> str | None:
+    author = item.get("author")
+    if isinstance(author, dict):
+        return clean_text(author.get("name"))
+    if isinstance(author, list):
+        names = []
+        for a in author:
+            if isinstance(a, dict) and a.get("name"):
+                names.append(clean_text(a["name"]))
+            elif isinstance(a, str):
+                names.append(clean_text(a))
+        names = [n for n in names if n]
+        return ", ".join(names) if names else None
+    if isinstance(author, str):
+        return clean_text(author)
+    return None
+
+
+def extract_article_metadata_from_jsonld(jsonlds: list[dict]) -> dict:
+    article_types = {"NewsArticle", "Article", "ReportageNewsArticle"}
+
+    for item in jsonlds:
+        item_type = item.get("@type")
+        if isinstance(item_type, list):
+            type_match = any(t in article_types for t in item_type)
+        else:
+            type_match = item_type in article_types
+
+        if not type_match:
+            continue
+
+        return {
+            "title": first_nonempty(item.get("headline"), item.get("name")),
+            "description": first_nonempty(item.get("description")),
+            "date": first_nonempty(item.get("datePublished"), item.get("dateCreated")),
+            "author_name": extract_author_from_jsonld(item),
+            "section": first_nonempty(item.get("articleSection")),
+            "article_body": first_nonempty(item.get("articleBody")),
+        }
+
+    return {}
+
+
+def extract_meta_content(soup: BeautifulSoup, attr_name: str, attr_value: str) -> str | None:
+    tag = soup.find("meta", attrs={attr_name: attr_value})
+    if tag and tag.get("content"):
+        return clean_text(tag["content"])
+    return None
+
+
+def extract_article_text(soup: BeautifulSoup, jsonld_body: str | None = None) -> str | None:
+    if jsonld_body:
+        return clean_text(jsonld_body)
+
+    # ניסיון 1: article
+    article_tag = soup.find("article")
+    if article_tag:
+        paragraphs = [
+            clean_text(p.get_text(" ", strip=True))
+            for p in article_tag.find_all("p")
+        ]
+        paragraphs = [p for p in paragraphs if p and len(p) > 30]
+        if paragraphs:
+            return "\n".join(paragraphs)
+
+    # ניסיון 2: חיפוש קונטיינר לפי class/id שמרמזים על גוף כתבה
+    candidates = soup.find_all(
+        ["div", "section"],
+        attrs={
+            "class": re.compile(r"(article|story|body|text|content)", re.I)
+        }
+    ) + soup.find_all(
+        ["div", "section"],
+        attrs={
+            "id": re.compile(r"(article|story|body|text|content)", re.I)
+        }
+    )
+
+    best_text = None
+    best_len = 0
+
+    for candidate in candidates:
+        paragraphs = [
+            clean_text(p.get_text(" ", strip=True))
+            for p in candidate.find_all("p")
+        ]
+        paragraphs = [p for p in paragraphs if p and len(p) > 30]
+        joined = "\n".join(paragraphs).strip()
+        if len(joined) > best_len:
+            best_text = joined
+            best_len = len(joined)
+
+    if best_text:
+        return best_text
+
+    # ניסיון 3: fallback כללי
+    paragraphs = [
+        clean_text(p.get_text(" ", strip=True))
+        for p in soup.find_all("p")
+    ]
+    paragraphs = [p for p in paragraphs if p and len(p) > 50]
+
+    # סינון שורות UI נפוצות
+    filtered = []
+    bad_patterns = [
+        r"^\s*ynet\s*$",
+        r"^\s*עוד כתבות",
+        r"^\s*כתבו תגובה",
+        r"^\s*לכתבה זו",
+        r"^\s*תגובות",
+        r"^\s*הוספת תגובה",
+    ]
+    for p in paragraphs:
+        if any(re.search(bp, p, flags=re.I) for bp in bad_patterns):
+            continue
+        filtered.append(p)
+
+    if filtered:
+        return "\n".join(filtered)
+
+    return None
+
+
+def fetch_article_data(url: str, feed_category: str) -> dict | None:
+    try:
+        resp = session.get(url, timeout=20)
+        resp.raise_for_status()
+    except Exception as e:
+        print(f"[ERROR] failed fetching article: {url} -> {e}")
+        return None
+
+    soup = BeautifulSoup(resp.text, "html.parser")
+    jsonlds = extract_jsonld(soup)
+    jsonld_meta = extract_article_metadata_from_jsonld(jsonlds)
+
+    title = first_nonempty(
+        jsonld_meta.get("title"),
+        extract_meta_content(soup, "property", "og:title"),
+        extract_meta_content(soup, "name", "title"),
+        soup.title.get_text(strip=True) if soup.title else None,
+        soup.find("h1").get_text(" ", strip=True) if soup.find("h1") else None,
+    )
+
+    description = first_nonempty(
+        jsonld_meta.get("description"),
+        extract_meta_content(soup, "property", "og:description"),
+        extract_meta_content(soup, "name", "description"),
+    )
+
+    author_name = first_nonempty(
+        jsonld_meta.get("author_name"),
+        extract_meta_content(soup, "name", "author"),
+        extract_meta_content(soup, "property", "article:author"),
+    )
+
+    date_value = first_nonempty(
+        jsonld_meta.get("date"),
+        extract_meta_content(soup, "property", "article:published_time"),
+        extract_meta_content(soup, "name", "pubdate"),
+    )
+
+    article_type = first_nonempty(
+        jsonld_meta.get("section"),
+        feed_category
+    )
+
+    text = extract_article_text(soup, jsonld_body=jsonld_meta.get("article_body"))
+
+    if not title:
+        print(f"[WARN] no title found for: {url}")
+        return None
+
+    return {
+        "news_outlet_id": YNET_OUTLET_ID,
+        "date": date_value,
+        "title": title,
+        "description": description,
+        "type": article_type,
+        "link": url,
+        "text": text,
+        "author_name": author_name,
+        "scraped_at": utc_now_iso(),
+    }
+
+
+def scrape_ynet_feed(conn: sqlite3.Connection, feed_url: str, category_name: str, limit: int | None = None):
+    parsed = feedparser.parse(feed_url)
+
+    if getattr(parsed, "bozo", 0):
+        print(f"[WARN] feedparser bozo for {feed_url}: {getattr(parsed, 'bozo_exception', None)}")
+
+    category_id = get_or_create_category(conn, category_name)
+    entries = parsed.entries[:limit] if limit else parsed.entries
+
+    inserted = 0
+    skipped = 0
+
+    for entry in entries:
+        link = clean_text(getattr(entry, "link", None))
+        if not link:
+            skipped += 1
+            continue
+
+        if article_exists(conn, link):
+            skipped += 1
+            continue
+
+        article = fetch_article_data(link, feed_category=category_name)
+        if article is None:
+            skipped += 1
+            continue
+
+        # אם לא הצלחנו להוציא date מהכתבה עצמה, ננסה מה-RSS
+        if not article.get("date"):
+            article["date"] = parse_feed_date(entry)
+
+        article_id = insert_article(conn, article)
+        if article_id:
+            link_article_to_category(conn, article_id, category_id)
+            inserted += 1
+        else:
+            skipped += 1
+
+        conn.commit()
+
+    print(f"[DONE] {category_name}: inserted={inserted}, skipped={skipped}")
+
+
+def main():
+    conn = create_connection(DB_PATH)
+
+    try:
+        # מוודא שה-outlet קיים
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO News_Outlets (news_outlet_id, outlet_name, base_url)
+            VALUES (?, ?, ?);
+            """,
+            (YNET_OUTLET_ID, "YNET", "https://www.ynet.co.il")
+        )
+        conn.commit()
+
+        for category_name, feed_url in FEEDS.items():
+            scrape_ynet_feed(conn, feed_url, category_name=category_name, limit=None)
+
+    finally:
+        conn.close()
+
+
+if __name__ == "__main__":
+    main()
