@@ -1,5 +1,5 @@
 import requests
-from bs4 import BeautifulSoup, Tag
+from bs4 import BeautifulSoup
 import sqlite3
 from datetime import datetime
 import time
@@ -32,7 +32,7 @@ def normalize_scraped_at(dt=None):
     return dt.strftime("%Y-%m-%d %H:%M:%S")
 
 # ======================================================
-# GET עם backoff חכם
+# GET עם backoff חכם (כמו ב-C14)
 # ======================================================
 def fetch_with_backoff(url, timeout=20, max_attempts=6):
     for attempt in range(1, max_attempts + 1):
@@ -45,13 +45,14 @@ def fetch_with_backoff(url, timeout=20, max_attempts=6):
             return r
  
         code = r.status_code if r is not None else "NETWORK_ERR"
-        base = min(120, 5 * attempt * attempt)
+        base = min(120, 5 * attempt * attempt)  # 5,20,45,80,120...
         sleep_s = base + random.uniform(0, base / 2)
  
         print(f"⚠️ fetch failed ({code}) attempt {attempt}/{max_attempts}, sleep {sleep_s:.1f}s")
         time.sleep(sleep_s)
  
     return None
+ 
  
 # ======================================================
 # יצירת קטגוריה אם לא קיימת
@@ -60,19 +61,13 @@ def get_or_create_category(category_name):
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
  
-    cur.execute(
-        "SELECT category_id FROM categories WHERE category_name = ?",
-        (category_name,)
-    )
+    cur.execute("SELECT category_id FROM categories WHERE category_name = ?", (category_name,))
     row = cur.fetchone()
  
     if row:
         category_id = row[0]
     else:
-        cur.execute(
-            "INSERT INTO categories (category_name) VALUES (?)",
-            (category_name,)
-        )
+        cur.execute("INSERT INTO categories (category_name) VALUES (?)", (category_name,))
         category_id = cur.lastrowid
         print(f"✔ נוצרה קטגוריה חדשה: {category_name} (ID={category_id})")
  
@@ -80,55 +75,147 @@ def get_or_create_category(category_name):
     conn.close()
     return category_id
  
+ 
 # ======================================================
-# הכנסת כתבה למסד
+# הבאת לינקים מדף קטגוריה (page יחיד)
 # ======================================================
-def insert_article_to_db(data, outlet_id, category_id):
+def get_mako_category_links(category_url):
+    r = fetch_with_backoff(category_url, timeout=15)
+    if not r:
+        return []
+ 
+    soup = BeautifulSoup(r.text, "html.parser")
+    links = set()
+ 
+    for a in soup.find_all("a"):
+        href = a.get("href")
+        if not href:
+            continue
+ 
+        # הופך לקישור מלא
+        if href.startswith("/"):
+            href = "https://www.mako.co.il" + href
+ 
+        # תנאי זהות לכתבת מאקו
+        if "mako.co.il" in href and "Article" in href:
+            links.add(href)
+ 
+    return list(links)
+ 
+ 
+# ======================================================
+# סקרייפר כתבה MAKO (כמו שהיה, בלי לשנות HTML)
+# ======================================================
+def scrape_mako_article(url):
+    r = fetch_with_backoff(url, timeout=20)
+    if not r:
+        return None
+ 
+    soup = BeautifulSoup(r.text, "html.parser")
+ 
+    # ------ כותרת ------
+    title_tag = soup.find("h1")
+    title = title_tag.get_text(strip=True) if title_tag else None
+ 
+    # ------ TYPE אמיתי מהאתר (לא חובה, אבל נשמור אותו רק אם תרצי בעתיד) ------
+    # כרגע type במסד יהיה category_name כמו שביקשת.
+ 
+    # ------ description (subtitle) ------
+    description = None
+    sub_new = soup.find("p", class_=lambda x: x and "ArticleSubtitle_root" in x)
+    if sub_new:
+        description = sub_new.get_text(strip=True)
+    else:
+        h2_tag = soup.find("h2")
+        if h2_tag:
+            description = h2_tag.get_text(strip=True)
+ 
+    # ------ מחבר (שם בלבד) ------
+    author = None
+    tag1 = soup.find("span", class_=lambda x: x and "AuthorSourceAndSponsor_name" in x)
+    if tag1:
+        author = tag1.get_text(strip=True)
+ 
+    if not author:
+        tag2 = soup.find("a", class_=lambda x: x and "AuthorSourceAndSponsor_clickableName" in x)
+        if tag2:
+            author = tag2.get_text(strip=True)
+ 
+    # ------ תאריך ------
+    date = None
+    time_tag = soup.find("time")
+    if time_tag and time_tag.get("datetime"):
+        date = time_tag.get("datetime")
+ 
+    # ------ טקסט מלא ------
+    paragraphs = []
+ 
+    # 1) פסקאות בתבנית החדשה
+    for p in soup.find_all("p", class_=lambda x: x and "ArticleSubtitle_root" in x):
+        t = p.get_text(strip=True)
+        if len(t) > 25:
+            paragraphs.append(t)
+ 
+    # 2) פסקאות רגילות
+    for p in soup.find_all("p"):
+        t = p.get_text(strip=True)
+        if len(t) > 25 and t not in paragraphs and "תגובה" not in t:
+            paragraphs.append(t)
+ 
+    full_text = "\n".join(paragraphs)
+ 
+    return {
+        "title": title,
+        "description": description,
+        "author": author,
+        "date": date,
+        "text": full_text,
+        "url": url
+    }
+ 
+ 
+# ======================================================
+# הכנסת כתבה למסד (author_name טקסט, type = category_name)
+# ======================================================
+def insert_article_to_db(data, outlet_id, category_id, category_name):
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
  
-    cur.execute(
-        """
+    # כפילויות: לפי לינק או title+outlet
+    cur.execute("""
         SELECT news_article_id
         FROM News_articles
         WHERE link = ?
            OR (title = ? AND news_outlet_id = ?)
-        """,
-        (data["url"], data["title"], outlet_id)
-    )
+    """, (data["url"], data["title"], outlet_id))
+ 
     if cur.fetchone():
         print("➡️ כבר קיים במסד:", data["title"])
         conn.close()
         return
  
-    cur.execute(
-        """
+    cur.execute("""
         INSERT INTO News_articles
             (news_outlet_id, date, title, description, type, link, text, author_name, scraped_at)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """,
-        (
-            outlet_id,
-            data["date"],
-            data["title"],
-            data["description"],
-            data["type"],
-            data["url"],
-            data["text"],
-            data["author"],
-            normalize_scraped_at()
-        )
-    )
+    """, (
+        outlet_id,
+        data["date"] or datetime.now().strftime("%Y-%m-%d"),
+        data["title"],
+        data["description"],
+        category_name,     # ✅ כמו C14: type = שם הקטגוריה
+        data["url"],
+        data["text"],
+        data["author"],     # ✅ שם המחבר כטקסט
+        normalize_scraped_at()
+    ))
  
     article_id = cur.lastrowid
  
-    cur.execute(
-        """
+    cur.execute("""
         INSERT INTO Article_Categories (news_article_id, category_id)
         VALUES (?, ?)
-        """,
-        (article_id, category_id)
-    )
+    """, (article_id, category_id))
  
     conn.commit()
     conn.close()
@@ -217,219 +304,198 @@ def get_or_insert_comment_id(
     return cur.lastrowid
 
 
-def scrape_comments_from_c14(article_url, news_article_id):
+def get_n12_talkbacks_url(article_url):
     """
-    C14 comments are available via JSON API (no need for JS rendering).
+    Build tabletapp url from the mako article url, then extract the nTalkbacksPage url.
     """
-    # article URL is like: https://www.c14.co.il/article/1504586
-    m = re.search(r"/article/(\\d+)", article_url)
-    if not m:
-        print("❌ לא הצלחתי להוציא article_id מתוך:", article_url)
+    tablet_url = article_url
+    tablet_url = tablet_url.replace("https://www.mako.co.il", "https://tabletapp.mako.co.il")
+    tablet_url = tablet_url.replace("http://www.mako.co.il", "https://tabletapp.mako.co.il")
+
+    r = fetch_with_backoff(tablet_url, timeout=20)
+    if not r:
+        return None
+
+    soup = BeautifulSoup(r.text, "html.parser")
+    for a in soup.find_all("a"):
+        href = a.get("href") or ""
+        if "nTalkbacksPage" in href:
+            if href.startswith("/"):
+                href = "https://tabletapp.mako.co.il" + href
+            return href
+    return None
+
+
+def scrape_comments_from_n12(article_url, news_article_id):
+    """
+    Best-effort scraping from tabletapp nTalkbacksPage.
+    If the server returns template placeholders (JS-rendered), we skip.
+    """
+    talkbacks_url = get_n12_talkbacks_url(article_url)
+    if not talkbacks_url:
+        print("⚠️ לא נמצא nTalkbacksPage עבור:", article_url)
         return
-    c14_article_id = int(m.group(1))
 
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
     source_url = article_url
 
-    base = "https://www.c14.co.il/wp-json/now14-api/v1/comments"
-    per_page = 50
-    offset = 0
-    max_pages = 20  # safety bound
-    pages_seen = 0
-
     try:
-        def insert_tree(node, parent_db_id):
-            author_name = (node.get("author") or "").strip()
-            comment_text = (node.get("content") or "").strip()
+        # polite delay
+        time.sleep(random.uniform(0.8, 1.6))
+        r = fetch_with_backoff(talkbacks_url, timeout=25, max_attempts=6)
+        if not r:
+            print("⚠️ דילוג תגובות N12 (לא הצלחתי להביא talkbacks):", talkbacks_url)
+            return
+
+        html = r.text
+        # JS-rendered fallback detection (template tokens usually remain)
+        if "{post_body}" in html or "post_body" in html or "{post_replies}" in html:
+            print("⚠️ דילוג תגובות N12: נראה שתגובות נטענות דינמית (תבניות נשארו ב-HTML).")
+            return
+
+        soup = BeautifulSoup(html, "html.parser")
+
+        # Heuristic parsing: attempt to parse comment rows from tables.
+        # If nested/replies metadata exists via data-* attributes, we will map it.
+        comment_nodes = []
+        for tr in soup.find_all("tr"):
+            tds = tr.find_all("td")
+            if len(tds) < 3:
+                continue
+            author = tds[0].get_text(" ", strip=True)
+            title = tds[1].get_text(" ", strip=True) if tds[1] else ""
+            body = tds[2].get_text(" ", strip=True)
+            if not body:
+                continue
+            # Skip obvious non-comment/template lines
+            if "ביטול" in body and len(body) < 50:
+                continue
+
+            parent_db_id = None
+
+            # Optional nested mapping using data-* / id / inputs
+            post_key = None
+            parent_key = None
+            try:
+                post_key = tr.get("data-post-index") or tr.get("data-postid") or None
+                parent_key = tr.get("data-parent-index") or tr.get("data-parentid") or None
+            except Exception:
+                pass
+
+            comment_nodes.append({
+                "post_key": post_key,
+                "parent_key": parent_key,
+                "author": author,
+                "title": title,
+                "body": body
+            })
+
+        if not comment_nodes:
+            print("⚠️ דילוג תגובות N12: לא נמצאו תגובות ב-HTML שאפשר לפרש.")
+            return
+
+        # If we have keys, map parent->db id for nesting; otherwise all top-level.
+        id_by_post_key = {}
+
+        for node in comment_nodes:
+            author_name = (node["author"] or "").strip()
+            comment_text = (node["body"] or "").strip()
             if not comment_text:
-                return None
-            likes = int(node.get("likes") or 0)
-            dislikes = int(node.get("dislikes") or 0)
-            comment_title = None
+                continue
+            comment_title = node["title"].strip() if node["title"] else None
+
+            parent_comment_db_id = None
+            if node["parent_key"]:
+                parent_comment_db_id = id_by_post_key.get(node["parent_key"])
 
             db_comment_id = get_or_insert_comment_id(
                 cur=cur,
                 news_article_id=news_article_id,
-                parent_comment_id=parent_db_id,
+                parent_comment_id=parent_comment_db_id,
                 author_name=author_name,
                 comment_title=comment_title,
                 comment_text=comment_text,
-                likes=likes,
-                dislikes=dislikes,
+                likes=0,
+                dislikes=0,
                 source_url=source_url
             )
 
-            for child in (node.get("subComments") or []):
-                insert_tree(child, db_comment_id)
-            return db_comment_id
-
-        while pages_seen < max_pages:
-            time.sleep(random.uniform(0.8, 1.6))
-            r = fetch_with_backoff(
-                f"{base}?article_id={c14_article_id}&per_page={per_page}&offset={offset}",
-                timeout=30,
-                max_attempts=6
-            )
-            if not r:
-                break
-
-            try:
-                items = r.json()
-            except Exception:
-                print("❌ תגובות C14 לא בפורמט JSON:", article_url)
-                break
-
-            if not items:
-                break
-
-            for node in items:
-                insert_tree(node, None)
-
-            offset += per_page
-            pages_seen += 1
+            if node["post_key"]:
+                id_by_post_key[node["post_key"]] = db_comment_id
 
         conn.commit()
-        print(f"✔️ הוכנסו תגובות C14 (אולי חלקיות) ל-article_id={news_article_id}")
+        print(f"✔️ הוכנסו תגובות N12 (אולי חלקיות) ל-article_id={news_article_id}")
     except Exception as e:
-        print("❌ שגיאה בעת scraping תגובות C14:", e)
+        print("❌ שגיאה בעת scraping תגובות N12:", e)
     finally:
         conn.close()
  
+ 
 # ======================================================
-# ריצה על כל ארכיון ערוץ 14 – עד שאין עוד עמודים
+# ריצה על כל העמודים של MAKO category (page=1..∞)
 # ======================================================
-def scrape_c14_category(base_url, outlet_id):
-    category_name = "פוליטי"
+def scrape_mako_all_pages(base_url, outlet_id):
+    # ✅ אותו שם "type" כמו הסקרייפר האחרון שלך
+    category_name = "ביטחון / צבא"
     category_id = get_or_create_category(category_name)
  
     page = 1
+    seen_any = 0
+ 
     while True:
-        if page == 1:
-            url = base_url
-        else:
-            url = base_url.rstrip("/") + f"/page/{page}"
+        # לפי מה ששלחת: https://www.mako.co.il/news-military?page=2
+        page_url = f"{base_url}?page={page}"
  
         print("\n==============================")
-        print(f"📌 עמוד {page}: {url}")
+        print(f"📌 עמוד {page}: {page_url}")
         print("==============================")
  
-        r = fetch_with_backoff(url, timeout=15)
-        if not r:
-            print("❌ לא הצלחתי להביא את העמוד, עוצר.")
-            break
+        links = get_mako_category_links(page_url)
+        print(f"🔗 נמצאו {len(links)} כתבות בעמוד {page}")
  
-        soup = BeautifulSoup(r.text, "html.parser")
-        links = set()
- 
-        for a in soup.find_all("a"):
-            href = a.get("href")
-            if not href:
-                continue
-            if href.startswith("/"):
-                href = "https://www.c14.co.il" + href
-            if "https://www.c14.co.il/article/" in href:
-                links.add(href)
- 
-        links = list(links)
-        print(f"🔗 נמצאו {len(links)} כתבות")
- 
+        # אם אין לינקים, נניח שנגמר
         if not links:
             print("🔚 אין עוד כתבות, עוצר.")
             break
  
-        for article_url in links:
-            rr = fetch_with_backoff(article_url, timeout=20)
-            if not rr:
-                print("❌ דילוג על כתבה:", article_url)
-                continue
+        # עוברים כתבה-כתבה
+        for url in links:
+            print("\n📥 מוריד כתבה:", url)
+            data = scrape_mako_article(url)
  
-            soup_a = BeautifulSoup(rr.text, "html.parser")
- 
-            # כותרת
-            title_tag = soup_a.find("h1")
-            title = title_tag.get_text(strip=True) if title_tag else None
-            if not title:
-                continue
- 
-            # תיאור
-            description = None
-            h2 = soup_a.find("h2")
-            if h2:
-                description = h2.get_text(strip=True)
- 
-            # מחבר
-            author = None
-            if title_tag:
-                for el in title_tag.next_elements:
-                    if isinstance(el, Tag):
-                        t = el.get_text(strip=True)
-                        if not t:
-                            continue
-                        if re.search(r"\(\d{2}\.\d{2}\.\d{2}\)", t):
-                            continue
-                        if t.isdigit():
-                            continue
-                        author = t
-                        break
- 
-            # תאריך
-            date_iso = None
-            meta_time = soup_a.find("meta", attrs={"property": "article:published_time"})
-            if meta_time and meta_time.get("content"):
-                date_iso = meta_time["content"][:10]
- 
-            if not date_iso:
-                m = re.search(r"\((\d{2})\.(\d{2})\.(\d{2})\)", soup_a.get_text())
-                if m:
-                    d, mth, y2 = m.groups()
-                    date_iso = f"{2000 + int(y2):04d}-{mth}-{d}"
- 
-            if not date_iso:
-                date_iso = datetime.now().strftime("%Y-%m-%d")
- 
-            # טקסט מלא
-            paragraphs = []
-            for p in soup_a.find_all("p"):
-                t = p.get_text(strip=True)
-                if len(t) > 25 and "הצטרפו למועדון" not in t and "תגובה" not in t:
-                    paragraphs.append(t)
- 
-            data = {
-                "title": title,
-                "description": description,
-                "author": author,
-                "date": date_iso,
-                "text": "\n".join(paragraphs),
-                "url": article_url,
-                "type": category_name
-            }
- 
-            insert_article_to_db(data, outlet_id, category_id)
- 
-            # ------------------------------
-            # תגובות (Comments)
-            # ------------------------------
-            article_id = get_article_id_by_link(article_url)
-            if article_id:
+            if data and data.get("title"):
+                insert_article_to_db(data, outlet_id, category_id, category_name)
+                # ------------------------------
+                # תגובות (Comments)
+                # ------------------------------
                 try:
-                    scrape_comments_from_c14(article_url, article_id)
+                    article_id = get_article_id_by_link(data["url"])
+                    if article_id:
+                        scrape_comments_from_n12(data["url"], article_id)
                 except Exception as e:
-                    print("❌ דילוג על תגובות בגלל שגיאה:", e)
-
-            # השהייה בין כתבות
+                    print("❌ דילוג על תגובות N12 בגלל שגיאה:", e)
+            else:
+                print("❌ שגיאה בקריאת הכתבה:", url)
+ 
+            # ✅ טיימר בין כתבות (כמו C14)
             time.sleep(random.uniform(5, 12))
  
-        # השהייה בין עמודים
+        seen_any += len(links)
+ 
+        # ✅ טיימר בין עמודים (כמו C14)
         time.sleep(random.uniform(12, 30))
         page += 1
+ 
  
 # ======================================================
 # main
 # ======================================================
 if __name__ == "__main__":
-    CHANNEL14_OUTLET_ID = 2  # לעדכן לפי הטבלה News_Outlets
-    scrape_c14_category(
-        base_url="https://www.c14.co.il/archive/65839",
-        outlet_id=CHANNEL14_OUTLET_ID
-    )
+    # MAKO outlet_id לדוגמה 1 (תעדכני אם אצלך שונה)
+    MAKO_OUTLET_ID = 1
+ 
+    # URL בסיס בלי page (אנחנו מוסיפים ?page=)
+    BASE_CATEGORY_URL = "https://www.mako.co.il/news-military"
+ 
+    scrape_mako_all_pages(BASE_CATEGORY_URL, MAKO_OUTLET_ID)
