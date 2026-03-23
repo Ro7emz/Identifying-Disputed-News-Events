@@ -24,6 +24,14 @@ HEADERS = {
 }
  
 # ======================================================
+# נרמול scraped_at (אחיד לכל הסקרייפרים)
+# ======================================================
+def normalize_scraped_at(dt=None):
+    if dt is None:
+        dt = datetime.now()
+    return dt.strftime("%Y-%m-%d %H:%M:%S")
+
+# ======================================================
 # GET עם backoff חכם
 # ======================================================
 def fetch_with_backoff(url, timeout=20, max_attempts=6):
@@ -96,8 +104,8 @@ def insert_article_to_db(data, outlet_id, category_id):
     cur.execute(
         """
         INSERT INTO News_articles
-            (news_outlet_id, date, title, description, type, link, text, author_name)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            (news_outlet_id, date, title, description, type, link, text, author_name, scraped_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             outlet_id,
@@ -107,7 +115,8 @@ def insert_article_to_db(data, outlet_id, category_id):
             data["type"],
             data["url"],
             data["text"],
-            data["author"]
+            data["author"],
+            normalize_scraped_at()
         )
     )
  
@@ -124,6 +133,168 @@ def insert_article_to_db(data, outlet_id, category_id):
     conn.commit()
     conn.close()
     print("✔️ הוכנסה כתבה:", data["title"])
+
+
+def get_article_id_by_link(link):
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT news_article_id
+        FROM News_articles
+        WHERE link = ?
+        LIMIT 1
+        """,
+        (link,)
+    )
+    row = cur.fetchone()
+    conn.close()
+    return row[0] if row else None
+
+
+def get_or_insert_comment_id(
+    cur,
+    news_article_id,
+    parent_comment_id,
+    author_name,
+    comment_title,
+    comment_text,
+    likes,
+    dislikes,
+    source_url
+):
+    # Duplicate check signature (no comment_external_id by requirement)
+    if parent_comment_id is None:
+        cur.execute(
+            """
+            SELECT comment_id
+            FROM Comments
+            WHERE news_article_id = ?
+              AND parent_comment_id IS NULL
+              AND author_name = ?
+              AND comment_text = ?
+              AND source_url = ?
+            LIMIT 1
+            """,
+            (news_article_id, author_name, comment_text, source_url)
+        )
+    else:
+        cur.execute(
+            """
+            SELECT comment_id
+            FROM Comments
+            WHERE news_article_id = ?
+              AND parent_comment_id = ?
+              AND author_name = ?
+              AND comment_text = ?
+              AND source_url = ?
+            LIMIT 1
+            """,
+            (news_article_id, parent_comment_id, author_name, comment_text, source_url)
+        )
+
+    row = cur.fetchone()
+    if row:
+        return row[0]
+
+    cur.execute(
+        """
+        INSERT INTO Comments
+            (news_article_id, parent_comment_id, author_name, comment_title, comment_text, likes, dislikes, source_url)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            news_article_id,
+            parent_comment_id,
+            author_name,
+            comment_title,
+            comment_text,
+            likes,
+            dislikes,
+            source_url
+        )
+    )
+    return cur.lastrowid
+
+
+def scrape_comments_from_c14(article_url, news_article_id):
+    """
+    C14 comments are available via JSON API (no need for JS rendering).
+    """
+    m = re.search(r"/article/(\\d+)", article_url)
+    if not m:
+        print("❌ לא הצלחתי להוציא c14 article_id מתוך:", article_url)
+        return
+    c14_article_id = int(m.group(1))
+
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    source_url = article_url
+
+    base = "https://www.c14.co.il/wp-json/now14-api/v1/comments"
+    per_page = 50
+    offset = 0
+    max_pages = 20  # safety bound
+    pages_seen = 0
+
+    try:
+        def insert_tree(node, parent_db_id):
+            author_name = (node.get("author") or "").strip()
+            comment_text = (node.get("content") or "").strip()
+            if not comment_text:
+                return None
+
+            likes = int(node.get("likes") or 0)
+            dislikes = int(node.get("dislikes") or 0)
+            comment_title = None
+
+            db_comment_id = get_or_insert_comment_id(
+                cur=cur,
+                news_article_id=news_article_id,
+                parent_comment_id=parent_db_id,
+                author_name=author_name,
+                comment_title=comment_title,
+                comment_text=comment_text,
+                likes=likes,
+                dislikes=dislikes,
+                source_url=source_url
+            )
+
+            for child in (node.get("subComments") or []):
+                insert_tree(child, db_comment_id)
+            return db_comment_id
+
+        while pages_seen < max_pages:
+            time.sleep(random.uniform(0.8, 1.6))
+            r = fetch_with_backoff(
+                f"{base}?article_id={c14_article_id}&per_page={per_page}&offset={offset}",
+                timeout=30,
+                max_attempts=6
+            )
+            if not r:
+                break
+
+            try:
+                items = r.json()
+            except Exception:
+                print("❌ תגובות C14 לא בפורמט JSON:", article_url)
+                break
+
+            if not items:
+                break
+
+            for node in items:
+                insert_tree(node, None)
+
+            offset += per_page
+            pages_seen += 1
+
+        conn.commit()
+        print(f"✔️ הוכנסו תגובות C14 (אולי חלקיות) ל-article_id={news_article_id}")
+    except Exception as e:
+        print("❌ שגיאה בעת scraping תגובות C14:", e)
+    finally:
+        conn.close()
  
 # ======================================================
 # ריצה על כל ארכיון ערוץ 14 – עד שאין עוד עמודים
@@ -236,6 +407,16 @@ def scrape_c14_category(base_url, outlet_id):
  
             insert_article_to_db(data, outlet_id, category_id)
  
+            # ------------------------------
+            # תגובות (Comments)
+            # ------------------------------
+            article_id = get_article_id_by_link(article_url)
+            if article_id:
+                try:
+                    scrape_comments_from_c14(article_url, article_id)
+                except Exception as e:
+                    print("❌ דילוג על תגובות בגלל שגיאה:", e)
+
             # השהייה בין כתבות
             time.sleep(random.uniform(5, 12))
  
