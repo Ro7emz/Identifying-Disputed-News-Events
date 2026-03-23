@@ -24,6 +24,14 @@ HEADERS = {
 }
  
 # ======================================================
+# נרמול scraped_at (אחיד לכל הסקרייפרים)
+# ======================================================
+def normalize_scraped_at(dt=None):
+    if dt is None:
+        dt = datetime.now()
+    return dt.strftime("%Y-%m-%d %H:%M:%S")
+
+# ======================================================
 # GET עם backoff חכם (כמו ב-C14)
 # ======================================================
 def fetch_with_backoff(url, timeout=20, max_attempts=6):
@@ -188,8 +196,8 @@ def insert_article_to_db(data, outlet_id, category_id, category_name):
  
     cur.execute("""
         INSERT INTO News_articles
-            (news_outlet_id, date, title, description, type, link, text, author_name)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            (news_outlet_id, date, title, description, type, link, text, author_name, scraped_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, (
         outlet_id,
         data["date"] or datetime.now().strftime("%Y-%m-%d"),
@@ -198,7 +206,8 @@ def insert_article_to_db(data, outlet_id, category_id, category_name):
         category_name,     # ✅ כמו C14: type = שם הקטגוריה
         data["url"],
         data["text"],
-        data["author"]     # ✅ שם המחבר כטקסט
+        data["author"],     # ✅ שם המחבר כטקסט
+        normalize_scraped_at()
     ))
  
     article_id = cur.lastrowid
@@ -211,6 +220,216 @@ def insert_article_to_db(data, outlet_id, category_id, category_name):
     conn.commit()
     conn.close()
     print("✔️ הוכנסה כתבה:", data["title"])
+
+
+def get_article_id_by_link(link):
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT news_article_id
+        FROM News_articles
+        WHERE link = ?
+        LIMIT 1
+        """,
+        (link,)
+    )
+    row = cur.fetchone()
+    conn.close()
+    return row[0] if row else None
+
+
+def get_or_insert_comment_id(
+    cur,
+    news_article_id,
+    parent_comment_id,
+    author_name,
+    comment_title,
+    comment_text,
+    likes,
+    dislikes,
+    source_url
+):
+    # Duplicate check signature (no comment_external_id by requirement)
+    if parent_comment_id is None:
+        cur.execute(
+            """
+            SELECT comment_id
+            FROM Comments
+            WHERE news_article_id = ?
+              AND parent_comment_id IS NULL
+              AND author_name = ?
+              AND comment_text = ?
+              AND source_url = ?
+            LIMIT 1
+            """,
+            (news_article_id, author_name, comment_text, source_url)
+        )
+    else:
+        cur.execute(
+            """
+            SELECT comment_id
+            FROM Comments
+            WHERE news_article_id = ?
+              AND parent_comment_id = ?
+              AND author_name = ?
+              AND comment_text = ?
+              AND source_url = ?
+            LIMIT 1
+            """,
+            (news_article_id, parent_comment_id, author_name, comment_text, source_url)
+        )
+
+    row = cur.fetchone()
+    if row:
+        return row[0]
+
+    cur.execute(
+        """
+        INSERT INTO Comments
+            (news_article_id, parent_comment_id, author_name, comment_title, comment_text, likes, dislikes, source_url)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            news_article_id,
+            parent_comment_id,
+            author_name,
+            comment_title,
+            comment_text,
+            likes,
+            dislikes,
+            source_url
+        )
+    )
+    return cur.lastrowid
+
+
+def get_n12_talkbacks_url(article_url):
+    """
+    Build tabletapp url from the mako article url, then extract the nTalkbacksPage url.
+    """
+    tablet_url = article_url
+    tablet_url = tablet_url.replace("https://www.mako.co.il", "https://tabletapp.mako.co.il")
+    tablet_url = tablet_url.replace("http://www.mako.co.il", "https://tabletapp.mako.co.il")
+
+    r = fetch_with_backoff(tablet_url, timeout=20)
+    if not r:
+        return None
+
+    soup = BeautifulSoup(r.text, "html.parser")
+    for a in soup.find_all("a"):
+        href = a.get("href") or ""
+        if "nTalkbacksPage" in href:
+            if href.startswith("/"):
+                href = "https://tabletapp.mako.co.il" + href
+            return href
+    return None
+
+
+def scrape_comments_from_n12(article_url, news_article_id):
+    """
+    Best-effort scraping from tabletapp nTalkbacksPage.
+    If the server returns template placeholders (JS-rendered), we skip.
+    """
+    talkbacks_url = get_n12_talkbacks_url(article_url)
+    if not talkbacks_url:
+        print("⚠️ לא נמצא nTalkbacksPage עבור:", article_url)
+        return
+
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    source_url = article_url
+
+    try:
+        # polite delay
+        time.sleep(random.uniform(0.8, 1.6))
+        r = fetch_with_backoff(talkbacks_url, timeout=25, max_attempts=6)
+        if not r:
+            print("⚠️ דילוג תגובות N12 (לא הצלחתי להביא talkbacks):", talkbacks_url)
+            return
+
+        html = r.text
+        # JS-rendered fallback detection (template tokens usually remain)
+        if "{post_body}" in html or "post_body" in html or "{post_replies}" in html:
+            print("⚠️ דילוג תגובות N12: נראה שתגובות נטענות דינמית (תבניות נשארו ב-HTML).")
+            return
+
+        soup = BeautifulSoup(html, "html.parser")
+
+        # Heuristic parsing: attempt to parse comment rows from tables.
+        # If nested/replies metadata exists via data-* attributes, we will map it.
+        comment_nodes = []
+        for tr in soup.find_all("tr"):
+            tds = tr.find_all("td")
+            if len(tds) < 3:
+                continue
+            author = tds[0].get_text(" ", strip=True)
+            title = tds[1].get_text(" ", strip=True) if tds[1] else ""
+            body = tds[2].get_text(" ", strip=True)
+            if not body:
+                continue
+            # Skip obvious non-comment/template lines
+            if "ביטול" in body and len(body) < 50:
+                continue
+
+            parent_db_id = None
+
+            # Optional nested mapping using data-* / id / inputs
+            post_key = None
+            parent_key = None
+            try:
+                post_key = tr.get("data-post-index") or tr.get("data-postid") or None
+                parent_key = tr.get("data-parent-index") or tr.get("data-parentid") or None
+            except Exception:
+                pass
+
+            comment_nodes.append({
+                "post_key": post_key,
+                "parent_key": parent_key,
+                "author": author,
+                "title": title,
+                "body": body
+            })
+
+        if not comment_nodes:
+            print("⚠️ דילוג תגובות N12: לא נמצאו תגובות ב-HTML שאפשר לפרש.")
+            return
+
+        # If we have keys, map parent->db id for nesting; otherwise all top-level.
+        id_by_post_key = {}
+
+        for node in comment_nodes:
+            author_name = (node["author"] or "").strip()
+            comment_text = (node["body"] or "").strip()
+            if not comment_text:
+                continue
+            comment_title = node["title"].strip() if node["title"] else None
+
+            parent_comment_db_id = None
+            if node["parent_key"]:
+                parent_comment_db_id = id_by_post_key.get(node["parent_key"])
+
+            db_comment_id = get_or_insert_comment_id(
+                cur=cur,
+                news_article_id=news_article_id,
+                parent_comment_id=parent_comment_db_id,
+                author_name=author_name,
+                comment_title=comment_title,
+                comment_text=comment_text,
+                likes=0,
+                dislikes=0,
+                source_url=source_url
+            )
+
+            if node["post_key"]:
+                id_by_post_key[node["post_key"]] = db_comment_id
+
+        conn.commit()
+        print(f"✔️ הוכנסו תגובות N12 (אולי חלקיות) ל-article_id={news_article_id}")
+    except Exception as e:
+        print("❌ שגיאה בעת scraping תגובות N12:", e)
+    finally:
+        conn.close()
  
  
 # ======================================================
@@ -247,6 +466,15 @@ def scrape_mako_all_pages(base_url, outlet_id):
  
             if data and data.get("title"):
                 insert_article_to_db(data, outlet_id, category_id, category_name)
+                # ------------------------------
+                # תגובות (Comments)
+                # ------------------------------
+                try:
+                    article_id = get_article_id_by_link(data["url"])
+                    if article_id:
+                        scrape_comments_from_n12(data["url"], article_id)
+                except Exception as e:
+                    print("❌ דילוג על תגובות N12 בגלל שגיאה:", e)
             else:
                 print("❌ שגיאה בקריאת הכתבה:", url)
  
