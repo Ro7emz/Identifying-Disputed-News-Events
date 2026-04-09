@@ -20,7 +20,6 @@ HEADERS = {
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
     "Accept-Language": "he-IL,he;q=0.9,en-US;q=0.8,en;q=0.7",
     "Connection": "keep-alive",
-    "Referer": "https://www.google.com/"
 }
 
 # ======================================================
@@ -80,18 +79,16 @@ def fetch_mako_comments(article_url, news_article_id):
         for item in comment_items:
             author = item.select_one(".talkback_author, .author_name, .author")
             content = item.select_one(".talkback_content, .comment_text, .content")
-            parent = item.get('id', "").replace('comment_', '') # מנסה למצוא מזהה הורה אם קיים
             
             if content:
                 cur.execute("""
                     INSERT OR IGNORE INTO Comments 
-                    (news_article_id, author_name, comment_text, source_url, parent_comment_id)
-                    VALUES (?, ?, ?, ?, ?)
+                    (news_article_id, author_name, comment_text, source_url)
+                    VALUES (?, ?, ?, ?)
                 """, (news_article_id, 
                       author.get_text(strip=True) if author else "אנונימי",
                       content.get_text(strip=True), 
-                      article_url,
-                      None)) # בגרסה הזו נשמור כשטוח, או נוסיף לוגיקת parent אם תרצי
+                      article_url))
                 if cur.rowcount > 0: count += 1
             
         conn.commit()
@@ -220,7 +217,7 @@ def insert_article_to_db(data, outlet_id, category_id, category_name):
     
     print("✔️ הוכנסה כתבה:", data["title"])
     
-    # הפעלה של איסוף תגובות מיד לאחר השמירה
+    # הפעלה של איסוף תגובות
     fetch_mako_comments(data["url"], article_id)
 
 # ======================================================
@@ -252,9 +249,14 @@ def scrape_mako_all_pages(base_url, outlet_id):
         page += 1
 
 # ======================================================
-# main
+# החלק שמפעיל את הכל - קריטי!
 # ======================================================
 if __name__ == "__main__":
+    # MAKO outlet_id (1)
     MAKO_OUTLET_ID = 1
+    
+    # URL בסיס
     BASE_CATEGORY_URL = "https://www.mako.co.il/news-military"
+    
+    # קריאה לפונקציית ההרצה
     scrape_mako_all_pages(BASE_CATEGORY_URL, MAKO_OUTLET_ID)
