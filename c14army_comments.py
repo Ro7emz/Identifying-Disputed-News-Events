@@ -44,6 +44,32 @@ def fetch_with_backoff(url, timeout=20, max_attempts=6):
         time.sleep(sleep_s)
  
     return None
+
+# ======================================================
+# GET JSON עם backoff חכם
+# ======================================================
+def fetch_json_with_backoff(url, timeout=20, max_attempts=6):
+    for attempt in range(1, max_attempts + 1):
+        try:
+            r = requests.get(url, headers=HEADERS, timeout=timeout)
+        except Exception:
+            r = None
+
+        if r is not None and r.status_code == 200:
+            try:
+                return r.json()
+            except Exception:
+                print(f"❌ התשובה אינה JSON: {url}")
+                return None
+
+        code = r.status_code if r is not None else "NETWORK_ERR"
+        base = min(120, 5 * attempt * attempt)
+        sleep_s = base + random.uniform(0, base / 2)
+
+        print(f"⚠️ JSON fetch failed ({code}) attempt {attempt}/{max_attempts}, sleep {sleep_s:.1f}s")
+        time.sleep(sleep_s)
+
+    return None
  
 # ======================================================
 # יצירת קטגוריה אם לא קיימת
@@ -71,7 +97,7 @@ def get_or_create_category(category_name):
     conn.commit()
     conn.close()
     return category_id
- 
+
 # ======================================================
 # הבאת article_id לפי לינק
 # ======================================================
@@ -92,6 +118,13 @@ def get_article_id_by_link(article_url):
 
     return row[0] if row else None
 
+# ======================================================
+# חילוץ article_id של C14 מתוך URL
+# ======================================================
+def extract_c14_article_id(article_url):
+    m = re.search(r"/article/(\d+)", article_url)
+    return m.group(1) if m else None
+ 
 # ======================================================
 # הכנסת כתבה למסד
 # ======================================================
@@ -153,9 +186,21 @@ def insert_article_to_db(data, outlet_id, category_id):
 # ======================================================
 # הכנסת תגובה למסד
 # ======================================================
-def insert_comment_to_db(news_article_id, author_name, comment_text, likes, dislikes, source_url, comment_title=None, parent_comment_id=None):
-    if not comment_text or not comment_text.strip():
+def insert_comment_to_db(
+    news_article_id,
+    author_name,
+    comment_text,
+    likes,
+    dislikes,
+    source_url,
+    comment_title=None,
+    parent_comment_id=None
+):
+    if not comment_text or not str(comment_text).strip():
         return
+
+    author_name = author_name.strip() if isinstance(author_name, str) else author_name
+    comment_text = str(comment_text).strip()
 
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
@@ -170,7 +215,7 @@ def insert_comment_to_db(news_article_id, author_name, comment_text, likes, disl
           AND comment_text = ?
           AND IFNULL(parent_comment_id, -1) = IFNULL(?, -1)
         """,
-        (news_article_id, author_name, comment_text.strip(), parent_comment_id)
+        (news_article_id, author_name, comment_text, parent_comment_id)
     )
     if cur.fetchone():
         conn.close()
@@ -188,7 +233,7 @@ def insert_comment_to_db(news_article_id, author_name, comment_text, likes, disl
             parent_comment_id,
             author_name,
             comment_title,
-            comment_text.strip(),
+            comment_text,
             likes,
             dislikes,
             source_url
@@ -200,108 +245,131 @@ def insert_comment_to_db(news_article_id, author_name, comment_text, likes, disl
     print("💬 נשמרה תגובה:", (comment_text[:60] + "...") if len(comment_text) > 60 else comment_text)
 
 # ======================================================
-# חילוץ מספר בטוח
+# חילוץ אינט בטוח
 # ======================================================
-def safe_int(text):
-    if text is None:
+def safe_int(value):
+    if value is None:
         return 0
-    text = text.strip()
+    if isinstance(value, int):
+        return value
+    text = str(value).strip()
     m = re.search(r"\d+", text)
     return int(m.group()) if m else 0
 
 # ======================================================
-# סקרייפר תגובות C14
+# ניסיון חילוץ שדות מתגובה מה-API
 # ======================================================
-def scrape_c14_comments(article_url, news_article_id):
-    r = fetch_with_backoff(article_url, timeout=20)
-    if not r:
-        print("❌ לא הצלחתי להביא את עמוד התגובות")
-        return
-
-    soup = BeautifulSoup(r.text, "html.parser")
-
-    comments_section = soup.find("div", id="comments-section")
-    if not comments_section:
-        print("ℹ️ לא נמצא comments-section")
-        return
-
-    # ניסיון למצוא את רשימת התגובות
-    comments_list = comments_section.find("ul")
-    if not comments_list:
-        print("ℹ️ לא נמצאה רשימת תגובות")
-        return
-
-    comment_blocks = comments_list.find_all(
-        "div",
-        class_=lambda x: x and "max-w-[90dvw]" in x and "gap-y-[8px]" in x
+def extract_comment_fields(comment_obj):
+    author_name = (
+        comment_obj.get("author_name")
+        or comment_obj.get("author")
+        or comment_obj.get("name")
+        or comment_obj.get("username")
+        or comment_obj.get("user_name")
     )
 
-    if not comment_blocks:
-        print("ℹ️ לא נמצאו בלוקים של תגובות")
-        return
+    comment_title = (
+        comment_obj.get("comment_title")
+        or comment_obj.get("title")
+    )
 
-    saved_count = 0
+    comment_text = (
+        comment_obj.get("comment_text")
+        or comment_obj.get("content")
+        or comment_obj.get("text")
+        or comment_obj.get("comment")
+        or comment_obj.get("body")
+        or comment_obj.get("message")
+    )
 
-    for block in comment_blocks:
-        try:
-            # שם כותב + זמן
-            top_spans = block.find_all("span")
-            author_name = None
-            if len(top_spans) >= 1:
-                author_name = top_spans[0].get_text(strip=True)
+    likes = safe_int(
+        comment_obj.get("likes")
+        or comment_obj.get("like_count")
+        or comment_obj.get("upvotes")
+        or comment_obj.get("upvote_count")
+    )
 
-            # טקסט התגובה - לוקחים את ה-p הראשון שלא שייך ללייקים/דיסלייקים
-            comment_text = None
-            p_tags = block.find_all("p")
-            for p in p_tags:
-                p_text = p.get_text(strip=True)
-                if not p_text:
-                    continue
-                # מסנן p של לייקים/דיסלייקים שהם רק מספר
-                if re.fullmatch(r"\d+", p_text):
-                    continue
-                comment_text = p_text
+    dislikes = safe_int(
+        comment_obj.get("dislikes")
+        or comment_obj.get("dislike_count")
+        or comment_obj.get("downvotes")
+        or comment_obj.get("downvote_count")
+    )
+
+    return author_name, comment_title, comment_text, likes, dislikes
+
+# ======================================================
+# סקרייפר תגובות C14 דרך API
+# ======================================================
+def scrape_c14_comments_api(c14_article_id, article_url, news_article_id):
+    print(f"🔎 מביא תגובות דרך API לכתבה {c14_article_id}")
+
+    offset = 0
+    total_saved_or_checked = 0
+
+    while True:
+        api_url = f"https://www.c14.co.il/comments?article_id={c14_article_id}&offset={offset}"
+        print("🌐", api_url)
+
+        data = fetch_json_with_backoff(api_url, timeout=15)
+        if data is None:
+            print("❌ לא התקבל JSON תקין מה-API של התגובות")
+            break
+
+        # לפעמים API מחזיר dict ולא list
+        if isinstance(data, dict):
+            if isinstance(data.get("comments"), list):
+                comments_batch = data["comments"]
+            elif isinstance(data.get("data"), list):
+                comments_batch = data["data"]
+            elif isinstance(data.get("results"), list):
+                comments_batch = data["results"]
+            else:
+                # אם אין מערך ברור של תגובות
+                print("ℹ️ מבנה JSON לא מוכר:", list(data.keys()))
                 break
+        elif isinstance(data, list):
+            comments_batch = data
+        else:
+            print("ℹ️ מבנה תשובה לא צפוי")
+            break
 
-            if not comment_text:
-                continue
+        if not comments_batch:
+            print("🔚 אין עוד תגובות")
+            break
 
-            # לייקים
-            likes = 0
-            like_img = block.find("img", alt="like")
-            if like_img:
-                like_parent = like_img.parent
-                if like_parent:
-                    like_p = like_parent.find("p")
-                    if like_p:
-                        likes = safe_int(like_p.get_text())
+        for comment_obj in comments_batch:
+            try:
+                if not isinstance(comment_obj, dict):
+                    continue
 
-            # דיסלייקים
-            dislikes = 0
-            dislike_img = block.find("img", alt="dislike")
-            if dislike_img:
-                dislike_parent = dislike_img.parent
-                if dislike_parent:
-                    dislike_p = dislike_parent.find("p")
-                    if dislike_p:
-                        dislikes = safe_int(dislike_p.get_text())
+                author_name, comment_title, comment_text, likes, dislikes = extract_comment_fields(comment_obj)
 
-            insert_comment_to_db(
-                news_article_id=news_article_id,
-                author_name=author_name,
-                comment_text=comment_text,
-                likes=likes,
-                dislikes=dislikes,
-                source_url=article_url,
-                comment_title=None,
-                parent_comment_id=None
-            )
-            saved_count += 1
+                insert_comment_to_db(
+                    news_article_id=news_article_id,
+                    author_name=author_name,
+                    comment_text=comment_text,
+                    likes=likes,
+                    dislikes=dislikes,
+                    source_url=article_url,
+                    comment_title=comment_title,
+                    parent_comment_id=None
+                )
 
-        except Exception as e:
-            print("❌ שגיאה בפענוח תגובה:", e)
+                total_saved_or_checked += 1
 
-    print(f"✅ הסתיים ניסיון שמירת תגובות. נשמרו/נבדקו: {saved_count}")
+            except Exception as e:
+                print("❌ שגיאה בעיבוד תגובה:", e)
+
+        # אם חזר פחות ממה שציפינו, כנראה נגמר
+        batch_size = len(comments_batch)
+        if batch_size == 0:
+            break
+
+        offset += batch_size
+        time.sleep(random.uniform(1, 2))
+
+    print(f"✅ הסתיים ניסיון שמירת תגובות. נשמרו/נבדקו: {total_saved_or_checked}")
  
 # ======================================================
 # ריצה על כל ארכיון ערוץ 14 – עד שאין עוד עמודים
@@ -412,15 +480,17 @@ def scrape_c14_category(base_url, outlet_id):
                 "type": category_name
             }
  
-            article_id = insert_article_to_db(data, outlet_id, category_id)
+            article_db_id = insert_article_to_db(data, outlet_id, category_id)
 
-            if not article_id:
-                article_id = get_article_id_by_link(article_url)
+            if not article_db_id:
+                article_db_id = get_article_id_by_link(article_url)
 
-            if article_id:
-                scrape_c14_comments(article_url, article_id)
+            c14_article_id = extract_c14_article_id(article_url)
+
+            if article_db_id and c14_article_id:
+                scrape_c14_comments_api(c14_article_id, article_url, article_db_id)
             else:
-                print("❌ לא הצלחתי למצוא news_article_id בשביל התגובות")
+                print("❌ לא הצלחתי למצוא article_id בשביל התגובות")
  
             # השהייה בין כתבות
             time.sleep(random.uniform(5, 12))
