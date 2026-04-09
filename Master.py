@@ -15,7 +15,7 @@ HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
 }
 
-# מילות מפתח לסינון (בעיקר עבור Ynet)
+# מילות מפתח לסינון
 KEYWORDS = ["צה\"ל", "צבא", "ביטחון", "בטחון", "מלחמה", "נתניהו", "חמאס", "חיזבאללה", "מדיני", "פוליטי", "כנסת", "עסקה", "חטופים", "איראן", "טראמפ"]
 
 # ==========================================
@@ -31,8 +31,11 @@ def clean_text(text):
     if not text: return ""
     return re.sub(r"\s+", " ", text).strip()
 
+def get_now_formatted():
+    """מחזירה את הזמן הנוכחי בפורמט: DD/MM/YYYY HH:MM"""
+    return datetime.now().strftime("%d/%m/%Y %H:%M")
+
 def fetch_ynet_comments(article_url, news_article_id):
-    """שואבת תגובות מ-Ynet ומתאימה למבנה בצילום המסך"""
     try:
         art_id = article_url.split('/')[-1].split('#')[0]
         api_url = f"https://www.ynet.co.il/bin/en/public/v1/talkbacks/get/{art_id}"
@@ -44,8 +47,6 @@ def fetch_ynet_comments(article_url, news_article_id):
         cursor = conn.cursor()
         count = 0
         for cb in comments:
-            # שימוש בשמות העמודות המדויקים מהצילום מסך:
-            # parent_comment_id ו-source_url
             cursor.execute("""
                 INSERT OR IGNORE INTO Comments 
                 (news_article_id, parent_comment_id, author_name, comment_title, comment_text, likes, dislikes, source_url)
@@ -57,7 +58,7 @@ def fetch_ynet_comments(article_url, news_article_id):
                   cb.get('text'), 
                   cb.get('up', 0), 
                   cb.get('down', 0),
-                  article_url)) # source_url הוא הקישור לכתבה
+                  article_url))
             if cursor.rowcount > 0: count += 1
         conn.commit()
         conn.close()
@@ -71,7 +72,8 @@ def scrape_article_content(url, outlet_id):
         if res.status_code != 200: return None
         soup = BeautifulSoup(res.text, "html.parser")
         
-        data = {"title": "", "author": "מערכת", "text": "", "description": "", "date": datetime.now().strftime("%Y-%m-%d"), "link": url}
+        # תאריך הכתבה עצמה (לא זמן הסריקה)
+        data = {"title": "", "author": "מערכת", "text": "", "description": "", "date": datetime.now().strftime("%d/%m/%Y"), "link": url}
 
         if outlet_id == 3: # YNET
             t = soup.select_one("h1.mainTitle, .mainTitle")
@@ -107,16 +109,17 @@ def save_all_to_db(conn, details, outlet_id, cat_name):
     cursor.execute("SELECT news_article_id FROM News_articles WHERE link = ?", (details['link'],))
     if cursor.fetchone(): return
     
-    # שימוש בשמות העמודות המדויקים מהצילום מסך
+    # כאן השתמשתי בפורמט החדש עבור scraped_at
+    scraped_at_formatted = get_now_formatted()
+    
     cursor.execute("""
         INSERT INTO News_articles (news_outlet_id, date, title, description, type, link, text, author_name, scraped_at)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, (outlet_id, details['date'], details['title'], details['description'], cat_name, 
-          details['link'], details['text'], details['author'], datetime.now().isoformat()))
+          details['link'], details['text'], details['author'], scraped_at_formatted))
     
     new_id = cursor.lastrowid
     
-    # קטגוריות
     cursor.execute("INSERT OR IGNORE INTO categories (category_name) VALUES (?)", (cat_name,))
     cat_id = conn.execute("SELECT category_id FROM categories WHERE category_name = ?", (cat_name,)).fetchone()[0]
     cursor.execute("INSERT INTO Article_Categories (news_article_id, category_id) VALUES (?, ?)", (new_id, cat_id))
@@ -132,6 +135,7 @@ def save_all_to_db(conn, details, outlet_id, cat_name):
 def main():
     conn = get_connection()
     
+    # 1. YNET
     print("\n--- [3] סורק YNET ---")
     res = requests.get("https://www.ynet.co.il/news/247", headers=HEADERS)
     if res.status_code == 200:
